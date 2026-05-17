@@ -223,20 +223,6 @@ else:
     print(f"\nModelo guardado en '{MODELO_PATH}'")
 
     # =====================================================
-    # MATRIZ DE CONFUSIÓN
-    #   Filas   = clase real
-    #   Columnas = clase predicha
-    # =====================================================
-
-    predicciones = model.predict(x_test, verbose=0)
-    predicciones = np.argmax(predicciones, axis=1)
-
-    matriz = confusion_matrix(y_test, predicciones)
-
-    print("\nMatriz de confusión:\n")
-    print(matriz)
-
-    # =====================================================
     # GRÁFICA DE ACCURACY
     # =====================================================
 
@@ -251,6 +237,31 @@ else:
     plt.legend()
     plt.tight_layout()
     plt.show()
+
+# =========================================================
+# MATRIZ DE CONFUSIÓN (Se calcula siempre)
+#   Filas   = clase real
+#   Columnas = clase predicha
+# =========================================================
+
+print("\nEvaluando datos de prueba para generar la matriz de confusión...")
+predicciones = model.predict(x_test, verbose=0)
+predicciones = np.argmax(predicciones, axis=1)
+
+matriz = confusion_matrix(y_test, predicciones)
+
+print("\nMatriz de confusión:\n")
+print(matriz)
+
+print("\nDetalle de aciertos y errores por dígito:")
+print(f"{'Dígito':<8} | {'Verdaderos Pos. (TP)':<22} | {'Falsos Pos. (FP)':<18} | {'Falsos Neg. (FN)':<18} | {'Verdaderos Neg. (TN)':<22}")
+print("-" * 98)
+for i in range(10):
+    TP = matriz[i, i]
+    FP = np.sum(matriz[:, i]) - TP
+    FN = np.sum(matriz[i, :]) - TP
+    TN = np.sum(matriz) - (TP + FP + FN)
+    print(f"{i:<8} | {TP:<22} | {FP:<18} | {FN:<18} | {TN:<22}")
 
 # =========================================================
 # SELECCIONAR IMAGEN EXTERNA
