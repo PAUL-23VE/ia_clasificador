@@ -1,80 +1,131 @@
 # =========================================================
 # RED NEURONAL MULTICLASE - CLASIFICACIÓN DE DÍGITOS
 # KERAS + OPENCV + MNIST
-#
-# MODELO MATEMÁTICO:
-#   Forward:  z = X·β + b  →  ReLU(z)  →  Softmax(z)
-#   Pérdida:  L = -Σ y·log(ŷ)
-#   Optimiz.: Adam (backpropagation automática)
 # =========================================================
 
-# =========================================================
-# LIBRERÍAS
-# =========================================================
-
-import sys
-import os
-
-import cv2
-import numpy as np
-import matplotlib.pyplot as plt
-
+# --- IMPORTACIÓN DE LIBRERÍAS ---
+# sys, os: Para interactuar con el sistema operativo (rutas, salir del programa).
+import sys, os
+# cv2: Librería OpenCV para todo el procesamiento de visión computacional (recortes, filtros, contornos).
+# numpy as np: Librería fundamental para operaciones matemáticas avanzadas y manejo de matrices/vectores.
+import cv2, numpy as np
+# Tkinter: Usado exclusivamente para abrir la ventana nativa de selección de archivos de Windows/Linux.
 from tkinter import Tk
 from tkinter.filedialog import askopenfilename
-
-# TensorFlow / Keras — importaciones unificadas
+# keras / tensorflow: El motor de Inteligencia Artificial. Keras es la API de alto nivel para construir la red.
 from tensorflow import keras
 from tensorflow.keras import layers
 from tensorflow.keras.datasets import mnist
-
+import tensorflow as tf
+# confusion_matrix: Herramienta matemática de scikit-learn para evaluar qué tanto se equivoca el modelo.
 from sklearn.metrics import confusion_matrix
 
 # =========================================================
-# CONFIGURACIÓN
+# CONSTRAINT PARA RECORTAR PESOS (REGULARIZACIÓN MATEMÁTICA)
 # =========================================================
+class ClipWeights(keras.constraints.Constraint):
+    """
+    Constraint personalizado (Restricción Matemática).
+    Defensa: En las redes neuronales, si los "pesos" (weights) crecen demasiado, 
+    el modelo se vuelve inestable (fenómeno de gradientes explosivos) y memoriza en lugar de aprender.
+    Esta clase fuerza a que, después de cada actualización matemática, ningún peso sea 
+    menor a -1 ni mayor a 1.
+    """
+    def __init__(self, min_value=-1.0, max_value=1.0):
+        self.min, self.max = float(min_value), float(max_value)
+        
+    def __call__(self, w):
+        # tf.clip_by_value: Función de tensorFlow que recorta literalmente la matriz de pesos al rango dado.
+        return tf.clip_by_value(w, self.min, self.max)
+        
+    def get_config(self):
+        # Necesario para que Keras sepa cómo guardar esta clase personalizada en el archivo .keras
+        return {'min_value': self.min, 'max_value': self.max}
 
-MODELO_PATH = "modelo_mnist.keras"
-
-# Umbral de confianza para aceptar una predicción.
-# 0.55 es más tolerante con tipografías de impresora/placa
-# que difieren del estilo manuscrito de MNIST.
-CONFIANZA_MINIMA = 0.55
+# Instanciamos la restricción para usarla en todas las capas.
+clip = ClipWeights(-1.0, 1.0)
 
 # =========================================================
-# CARGAR DATASET MNIST
+# CAPA DENSE PERSONALIZADA CON UN SOLO BIAS ESCALAR
 # =========================================================
+class OneBiasDense(keras.layers.Layer):
+    """
+    Defensa: Una capa "Dense" normal calcula Z = W*X + b, donde 'b' es un vector 
+    (un sesgo por cada neurona). Esta clase matemática personalizada modifica esa 
+    ecuación para que todas las neuronas de la capa compartan un ÚNICO sesgo escalar.
+    Esto reduce el número de parámetros libres y obliga a la red a ser más eficiente.
+    """
+    def __init__(self, units, activation=None, kernel_constraint=None, bias_constraint=None, use_bias=True, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.units = int(units) # Número de neuronas en esta capa
+        self.activation = keras.activations.get(activation) # Función de activación (ReLU o Softmax)
+        self.kernel_constraint = keras.constraints.get(kernel_constraint) if kernel_constraint else None
+        self.bias_constraint = keras.constraints.get(bias_constraint) if bias_constraint else None
+        self.use_bias = use_bias
+        # Creamos una capa densa normal pero le APAGAMOS el bias nativo (use_bias=False)
+        self._dense = layers.Dense(self.units, use_bias=False, kernel_constraint=self.kernel_constraint)
 
-print("=" * 55)
+    def build(self, input_shape):
+        # Se ejecuta la primera vez que la capa recibe datos para inicializar variables
+        self._dense.build(input_shape)
+        if self.use_bias:
+            # Aquí inyectamos matemáticamente NUESTRO bias: un escalar de forma (1,) inicializado en cero.
+            self.bias = self.add_weight(shape=(1,), initializer='zeros', trainable=True, name='bias', constraint=self.bias_constraint)
+        else:
+            self.bias = None
+        super().build(input_shape)
+
+    def call(self, inputs):
+        # Forward Propagation de esta capa: Z = W*X
+        x = self._dense(inputs)
+        if self.bias is not None:
+            # Z = (W*X) + b_escalar (gracias a las reglas de broadcasting de matrices)
+            x = x + self.bias
+        # Retorna Activación(Z)
+        return self.activation(x) if self.activation else x
+
+    def get_config(self):
+        # Permite serializar y guardar nuestra capa extraña en el disco duro.
+        config = super().get_config()
+        config.update({
+            "units": self.units,
+            "activation": keras.activations.serialize(self.activation),
+            "kernel_constraint": keras.constraints.serialize(self.kernel_constraint),
+            "bias_constraint": keras.constraints.serialize(self.bias_constraint),
+            "use_bias": self.use_bias,
+        })
+        return config
+
+# =========================================================
+# CONFIGURACIÓN GLOBAL
+# =========================================================
+MODELO_PATH = "modelo_mnist.keras" # Archivo donde vivirá la IA
+# Umbral mínimo para aceptar un dígito en la vida real. 
+# Si la red duda y predice con menos de 40% de certeza, ignoramos la predicción por seguridad.
+CONFIANZA_MINIMA = 0.40
+
+# =========================================================
+# 1. CARGA Y PREPROCESAMIENTO DEL DATASET MNIST
+# =========================================================
+print("="*55)
 print("  SISTEMA DE CLASIFICACIÓN DE DÍGITOS — MNIST")
-print("=" * 55)
+print("="*55)
 print("\nCargando dataset MNIST...")
 
+# MNIST contiene 70,000 imágenes (60k entrenamiento, 10k prueba) de dígitos escritos a mano.
 (x_train, y_train), (x_test, y_test) = mnist.load_data()
-
 print("Dataset cargado correctamente")
 
-# =========================================================
-# NORMALIZACIÓN: 0–255  →  0.0–1.0
-# Divide cada pixel entre 255 para mantener valores
-# en el rango [0,1], lo que estabiliza el entrenamiento.
-# =========================================================
+# NORMALIZACIÓN MATEMÁTICA: 
+# Los píxeles van de 0 (negro) a 255 (blanco). Dividimos entre 255.0 para aplastarlos al rango [0.0, 1.0].
+# Defensa: Las redes neuronales trabajan infinitamente mejor y convergen más rápido con números pequeños entre 0 y 1.
+x_train, x_test = x_train.astype("float32")/255.0, x_test.astype("float32")/255.0
 
-x_train = x_train.astype("float32") / 255.0
-x_test  = x_test.astype("float32")  / 255.0
-
-# =========================================================
-# CONVERSIÓN: imagen 28×28  →  vector de 784 características
-#
-# Cada imagen se "aplana" en un vector fila:
-#   X ∈ ℝ^(n × 784)   donde n = número de muestras
-# =========================================================
-
-x_train = x_train.reshape(-1, 784)
-x_test  = x_test.reshape(-1, 784)
-
-# =========================================================
-# INFORMACIÓN DEL DATASET
-# =========================================================
+# APLANAMIENTO (FLATTEN):
+# Una imagen es una matriz 2D de 28x28 píxeles. 
+# Nuestra red es un Perceptrón Multicapa (MLP) que requiere vectores 1D.
+# Transformamos 28x28 en un vector fila de 784 posiciones matemáticas (28 * 28 = 784).
+x_train, x_test = x_train.reshape(-1, 784), x_test.reshape(-1, 784)
 
 print("\nInformación del dataset:")
 print(f"  Entradas entrenamiento : {x_train.shape}")
@@ -83,613 +134,297 @@ print(f"  Entradas prueba        : {x_test.shape}")
 print(f"  Etiquetas prueba       : {y_test.shape}")
 
 # =========================================================
-# CREAR O CARGAR MODELO
+# 2. CARGAR MODELO EXISTENTE O CREAR UNO NUEVO
 # =========================================================
-
 if os.path.exists(MODELO_PATH):
-
+    # Si ya entrenamos antes, no perdemos tiempo y lo cargamos directamente de memoria.
     print(f"\nModelo encontrado en '{MODELO_PATH}'. Cargando...")
-    model = keras.models.load_model(MODELO_PATH)
+    # Le pasamos custom_objects para que sepa cómo leer nuestras clases matemáticas raras.
+    model = keras.models.load_model(MODELO_PATH, custom_objects={'ClipWeights': ClipWeights, 'OneBiasDense': OneBiasDense})
     print("Modelo cargado correctamente.")
-
+    print("Recortando pesos cargados al rango [-1, 1]...")
+    # Aseguramos por seguridad que los pesos al cargar sigan cumpliendo la restricción [-1, 1]
+    for layer in model.layers:
+        try:
+            ws = layer.get_weights()
+            if not ws: continue
+            ws_clipped = [np.clip(w, -1.0, 1.0) for w in ws]
+            layer.set_weights(ws_clipped)
+        except Exception:
+            pass
 else:
-
+    # Si borramos el archivo, armamos la arquitectura desde cero.
     print("\nNo se encontró modelo guardado. Creando red neuronal...")
-
-    # =====================================================
-    # ARQUITECTURA DE LA RED NEURONAL
-    #
-    # Entrada  →  Capa 1 (ReLU)  →  Capa 2 (ReLU)  →  Salida (Softmax)
-    #
-    # Cada capa densa calcula:
-    #   z = X·β + b          (ecuación de la recta generalizada)
-    #   a = ReLU(z)          (activación en capas ocultas)
-    #   ŷ = Softmax(z)       (activación en capa de salida)
-    #
-    # Donde:
-    #   β  = matriz de pesos  (shape: entradas × neuronas)
-    #   b  = vector de bias   (shape: neuronas)
-    #   X  = vector de entrada (shape: batch × 784)
-    # =====================================================
-
+    
+    # ARQUITECTURA DEL PERCEPTRÓN MULTICAPA (MLP)
     model = keras.Sequential([
-
-        # Capa de entrada explícita — 784 características
+        # Capa de Entrada: 784 píxeles simultáneos.
         layers.Input(shape=(784,)),
-
-        # -------------------------------------------------
-        # CAPA OCULTA 1
-        #   z₁ = X·β₁ + b₁         (784 → 128)
-        #   a₁ = ReLU(z₁) = max(0, z₁)
-        # -------------------------------------------------
-        layers.Dense(
-            128,
-            activation='relu',
-            use_bias=True,
-            name="capa_oculta_1"
-        ),
-
-        # Dropout: desactiva 20 % de neuronas aleatoriamente
-        # durante el entrenamiento para reducir overfitting
-        layers.Dropout(0.2, name="dropout_1"),
-
-        # -------------------------------------------------
-        # CAPA OCULTA 2
-        #   z₂ = a₁·β₂ + b₂        (128 → 64)
-        #   a₂ = ReLU(z₂) = max(0, z₂)
-        # -------------------------------------------------
-        layers.Dense(
-            64,
-            activation='relu',
-            use_bias=True,
-            name="capa_oculta_2"
-        ),
-
-        # -------------------------------------------------
-        # CAPA DE SALIDA
-        #   z₃ = a₂·β₃ + b₃        (64 → 10)
-        #   ŷᵢ = e^(zᵢ) / Σ e^(zⱼ)  (Softmax multiclase)
-        # Produce una distribución de probabilidad sobre
-        # los 10 dígitos posibles (0–9).
-        # -------------------------------------------------
-        layers.Dense(
-            10,
-            activation='softmax',
-            use_bias=True,
-            name="capa_salida"
-        )
+        
+        # Capa Oculta 1: 128 neuronas. 
+        # Activación ReLU: f(x) = max(0, x). Permite aprender relaciones no lineales (curvas).
+        OneBiasDense(128, activation='relu', kernel_constraint=clip, bias_constraint=clip, name="capa_oculta_1"),
+        
+        # Dropout (Regularización): 
+        # Defensa: Apaga al azar el 30% de las conexiones en cada paso. Esto IMPIDE que la red "memorice" 
+        # las imágenes exactas y la obliga a "aprender" los patrones generales, mejorando la robustez.
+        layers.Dropout(0.3),  
+        
+        # Capa Oculta 2: 64 neuronas. Embudamos la información.
+        OneBiasDense(64, activation='relu', kernel_constraint=clip, bias_constraint=clip, name="capa_oculta_2"),
+        layers.Dropout(0.2),  # Apaga el 20% para seguir forzando el aprendizaje real.
+        
+        # Capa de Salida: 10 neuronas (dígitos del 0 al 9).
+        # Activación Softmax: Convierte las salidas matemáticas brutas en Probabilidades (Porcentajes) que suman 100%.
+        OneBiasDense(10, activation='softmax', kernel_constraint=clip, bias_constraint=clip, name="capa_salida")
     ])
-
-    # =====================================================
-    # COMPILAR EL MODELO
-    #
-    # Función de pérdida: Entropía cruzada categórica
-    #   L = -Σ yᵢ · log(ŷᵢ)
-    #
-    # Optimizador: Adam (variante adaptativa de SGD con
-    #   momentum, estima primer y segundo momento del
-    #   gradiente para actualizar pesos eficientemente)
-    # =====================================================
-
-    model.compile(
-        optimizer='adam',
-        loss='sparse_categorical_crossentropy',
-        metrics=['accuracy']
-    )
-
-    # =====================================================
-    # RESUMEN DE LA RED
-    # =====================================================
-
-    print("\nResumen del modelo:\n")
-    model.summary()
-
-    # =====================================================
-    # ENTRENAMIENTO
-    #   - epochs     : número de pasadas completas sobre
-    #                  el dataset
-    #   - batch_size : muestras procesadas antes de
-    #                  actualizar pesos (mini-batch SGD)
-    #   - validation : evalúa en test al final de cada
-    #                  época para detectar overfitting
-    # =====================================================
-
+    
+    # COMPILACIÓN DEL MODELO
+    # Optimizador Adam: Ajusta la "velocidad de aprendizaje" de forma dinámica (momentos de primer y segundo orden).
+    # Función de Pérdida (Loss): Entropía Cruzada Categórica, ideal para clasificaciones multiclase.
+    model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    
     print("\nEntrenando red neuronal...\n")
-
-    historial = model.fit(
-        x_train,
-        y_train,
-        epochs=10,
-        batch_size=32,
-        validation_data=(x_test, y_test)
-    )
-
-    # =====================================================
-    # EVALUACIÓN
-    # =====================================================
-
-    print("\nEvaluando modelo en conjunto de prueba...\n")
-
-    loss, accuracy = model.evaluate(x_test, y_test)
-
-    print(f"\nLoss    : {loss:.4f}")
-    print(f"Accuracy: {accuracy:.4f}  ({accuracy*100:.2f} %)")
-
-    # =====================================================
-    # GUARDAR MODELO
-    # =====================================================
-
-    model.save(MODELO_PATH)
-    print(f"\nModelo guardado en '{MODELO_PATH}'")
-
-    # =====================================================
-    # GRÁFICA DE ACCURACY
-    # =====================================================
-
-    plt.figure(figsize=(8, 4))
-
-    plt.plot(historial.history['accuracy'],     label='Entrenamiento')
-    plt.plot(historial.history['val_accuracy'], label='Validación')
-
-    plt.title("Accuracy por época")
-    plt.ylabel("Accuracy")
-    plt.xlabel("Época")
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
+    # ENTRENAMIENTO (Backpropagation):
+    # epochs=12: Repite el aprendizaje sobre todos los datos 12 veces.
+    # batch_size=32: Lee de 32 en 32 imágenes antes de corregir sus errores, logrando estabilidad matemática.
+    historial = model.fit(x_train, y_train, epochs=12, batch_size=32, validation_data=(x_test, y_test))
+    model.save(MODELO_PATH) # Guardamos la red en disco.
 
 # =========================================================
-# MATRIZ DE CONFUSIÓN (Se calcula siempre)
-#   Filas   = clase real
-#   Columnas = clase predicha
+# 3. EVALUACIÓN DE SOBREAJUSTE (APRENDIZAJE VS MEMORIZACIÓN)
 # =========================================================
+print("\nCalculando errores de Entrenamiento y Pruebas...")
+# Defensa: Evaluamos matemáticamente qué tan mal se equivoca con datos que conoce (train)
+# frente a datos que NUNCA ha visto (test).
+loss_train, acc_train = model.evaluate(x_train, y_train, verbose=0)
+loss_test, acc_test   = model.evaluate(x_test, y_test, verbose=0)
 
+print("\n" + "="*55)
+print(" COMPARATIVA DE ERRORES (Pérdida y Precisión)")
+print("="*55)
+print(f"  Entrenamiento -> Error: {loss_train:.4f} | Precisión: {acc_train*100:.2f}%")
+print(f"  Pruebas       -> Error: {loss_test:.4f} | Precisión: {acc_test*100:.2f}%")
+# Si el modelo solo memorizara, Pruebas tendría un error gigante. Como son parecidos, APRENDIÓ.
+print("="*55)
+
+# =========================================================
+# 4. MATRIZ DE CONFUSIÓN (EVALUACIÓN DETALLADA)
+# =========================================================
 print("\nEvaluando datos de prueba para generar la matriz de confusión...")
-predicciones = model.predict(x_test, verbose=0)
-predicciones = np.argmax(predicciones, axis=1)
-
+# Hacemos que la IA adivine las 10,000 imágenes de prueba
+predicciones = np.argmax(model.predict(x_test, verbose=0), axis=1)
+# Comparamos lo que predijo vs la realidad (y_test)
 matriz = confusion_matrix(y_test, predicciones)
 
 print("\nMatriz de confusión:\n")
 print(matriz)
 
+# Desglosamos la matriz de confusión matemáticamente para cada clase (0-9)
 print("\nDetalle de aciertos y errores por dígito:")
 print(f"{'Dígito':<8} | {'Verdaderos Pos. (TP)':<22} | {'Falsos Pos. (FP)':<18} | {'Falsos Neg. (FN)':<18} | {'Verdaderos Neg. (TN)':<22}")
-print("-" * 98)
+print("-"*98)
 for i in range(10):
-    TP = matriz[i, i]
-    FP = np.sum(matriz[:, i]) - TP
-    FN = np.sum(matriz[i, :]) - TP
-    TN = np.sum(matriz) - (TP + FP + FN)
+    TP = matriz[i, i]                            # Predijo la clase i correctamente.
+    FP = np.sum(matriz[:, i]) - TP               # Predijo clase i, pero en realidad era otra.
+    FN = np.sum(matriz[i, :]) - TP               # Era clase i, pero el modelo predijo otra cosa.
+    TN = np.sum(matriz) - (TP + FP + FN)         # Rechazó correctamente que no era la clase i.
     print(f"{i:<8} | {TP:<22} | {FP:<18} | {FN:<18} | {TN:<22}")
 
 # =========================================================
-# SELECCIONAR IMAGEN EXTERNA
+# 5. CARGA DE IMAGEN REAL (INTERFAZ Y OPENCV)
 # =========================================================
-
 print("\nSeleccione una imagen para clasificar...")
+root = Tk(); root.withdraw() # Ocultamos la ventana principal de Tkinter, solo queremos el diálogo de archivo.
+ruta = askopenfilename(title="Seleccione una imagen con números", filetypes=[("Imágenes", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff")])
+root.destroy()
+if not ruta: sys.exit(0) # Si cancela la ventana, salimos.
 
-root = Tk()
-root.withdraw()
-
-ruta = askopenfilename(
-    title="Seleccione una imagen con números",
-    filetypes=[
-        ("Imágenes", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff"),
-        ("Todos los archivos", "*.*")
-    ]
-)
-
-root.destroy()   # ← liberar ventana Tkinter correctamente
-
-# =========================================================
-# VALIDAR SELECCIÓN
-# =========================================================
-
-if not ruta:
-    print("No se seleccionó ninguna imagen. Saliendo...")
-    sys.exit(0)
-
-# =========================================================
-# LEER IMAGEN
-# =========================================================
-
-with open(ruta, "rb") as f:
-    data = f.read()
-
-img = cv2.imdecode(
-    np.frombuffer(data, np.uint8),
-    cv2.IMREAD_COLOR
-)
-
-if img is None:
-    print("Error: no se pudo cargar la imagen.")
-    sys.exit(1)
-
+# imdecode: Carga segura mediante búfer binario (evita errores con rutas que contengan tildes o espacios).
+img = cv2.imdecode(np.frombuffer(open(ruta,"rb").read(), np.uint8), cv2.IMREAD_COLOR)
+if img is None: sys.exit(1)
 print(f"\nImagen cargada: {ruta}")
 print(f"Dimensiones  : {img.shape[1]} × {img.shape[0]} px")
 
-# =========================================================
-# COPIA ORIGINAL (para dibujar resultados finales)
-# =========================================================
-
-original = img.copy()
+original = img.copy() # Guardamos copia para dibujar cuadritos verdes/rojos encima al final.
 
 # =========================================================
-# FUNCIÓN: MEJOR THRESHOLD AUTOMÁTICO
-#
-# Prueba dos métodos de binarización y elige el que
-# produce más contornos candidatos de dígitos, adaptándose
-# al contraste y tipo de imagen entregada.
-#
-# Método A — Adaptativo Gaussiano:
-#   Compara cada píxel contra la media ponderada de su
-#   vecindad local. Ideal para iluminación desigual.
-#
-# Método B — Otsu global:
-#   Calcula el umbral óptimo que minimiza la varianza
-#   intra-clase. Ideal para imágenes de alto contraste
-#   (placas, documentos impresos).
+# 6. PREPROCESAMIENTO OPENCV (VISIÓN COMPUTACIONAL)
 # =========================================================
-
-def mejor_threshold(gray_img):
-    """
-    Recibe imagen en escala de grises.
-    Devuelve la binarización que contiene más contornos
-    del tamaño apropiado para dígitos.
-    """
-    blur = cv2.GaussianBlur(gray_img, (5, 5), 0)
-
-    # Método A — Threshold adaptativo
-    th_adapt = cv2.adaptiveThreshold(
-        blur, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        11, 2
-    )
-
-    # Método B — Otsu (threshold global óptimo)
-    _, th_otsu = cv2.threshold(
-        blur, 0, 255,
-        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
-    )
-
-    # Contar contornos candidatos en cada método
-    # Un candidato válido tiene área entre 0.1% y 20%
-    # del área total de la imagen (proporcional)
-    area_img = gray_img.shape[0] * gray_img.shape[1]
-    area_min = area_img * 0.001
-    area_max = area_img * 0.20
-
-    def contar_candidatos(thresh_img):
-        cnts, _ = cv2.findContours(
-            thresh_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        count = 0
-        for c in cnts:
-            a = cv2.contourArea(c)
-            if area_min < a < area_max:
-                _, _, cw, ch = cv2.boundingRect(c)
-                ratio = cw / float(ch) if ch > 0 else 0
-                if 0.08 < ratio < 3.0:
-                    count += 1
-        return count
-
-    n_adapt = contar_candidatos(th_adapt)
-    n_otsu  = contar_candidatos(th_otsu)
-
-    print(f"  Threshold adaptativo → {n_adapt} candidatos")
-    print(f"  Threshold Otsu       → {n_otsu} candidatos")
-
-    if n_otsu >= n_adapt:
-        print("  Seleccionado: Otsu")
-        return th_otsu
-    else:
-        print("  Seleccionado: Adaptativo")
-        return th_adapt
-
-
-# =========================================================
-# FUNCIÓN: DETECTAR ZONA DE INTERÉS AUTOMÁTICAMENTE
-#
-# Busca el rectángulo más grande con proporción de placa
-# o panel de números dentro de la imagen. Si lo encuentra,
-# recorta esa zona para eliminar el fondo irrelevante.
-#
-# Criterios de una zona válida:
-#   - Ocupa entre 5% y 80% del área total
-#   - Relación ancho/alto entre 1.0 y 6.0
-#   - No es el rectángulo de la imagen entera
-# =========================================================
-
-def detectar_zona_interes(img_color):
-    """
-    Devuelve (zona_recortada, offset_x, offset_y).
-    Si no encuentra zona específica, devuelve imagen completa
-    con offsets en 0.
-    """
-    alt, anc = img_color.shape[:2]
-    area_total = alt * anc
-
-    gray_z = cv2.cvtColor(img_color, cv2.COLOR_BGR2GRAY)
-    blur_z = cv2.GaussianBlur(gray_z, (5, 5), 0)
-
-    # Usar Canny para detectar bordes fuertes (marcos, bordes de placa)
-    edges = cv2.Canny(blur_z, 30, 150)
-
-    # Dilatar para cerrar gaps en el contorno del marco
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    edges  = cv2.dilate(edges, kernel, iterations=2)
-
-    cnts, _ = cv2.findContours(
-        edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-
-    mejor     = None
-    mejor_area = 0
-
-    for c in cnts:
-        area_c = cv2.contourArea(c)
-
-        # Ignorar contornos muy pequeños o que sean casi la imagen entera
-        if area_c < area_total * 0.05:
-            continue
-        if area_c > area_total * 0.80:
-            continue
-
-        zx, zy, zw, zh = cv2.boundingRect(c)
-
-        # Proporción rectangular válida (panel de números)
-        ratio_z = zw / float(zh) if zh > 0 else 0
-        if ratio_z < 1.0 or ratio_z > 6.0:
-            continue
-
-        if area_c > mejor_area:
-            mejor_area = area_c
-            mejor = (zx, zy, zw, zh)
-
-    if mejor is not None:
-        zx, zy, zw, zh = mejor
-        # Pequeño margen de seguridad para no cortar bordes del dígito
-        margen = int(min(zw, zh) * 0.03)
-        zx = max(0, zx - margen)
-        zy = max(0, zy - margen)
-        zw = min(anc - zx, zw + margen * 2)
-        zh = min(alt - zy, zh + margen * 2)
-
-        zona = img_color[zy:zy+zh, zx:zx+zw]
-        print(f"  Zona detectada automáticamente: "
-              f"x={zx}, y={zy}, {zw}×{zh} px")
-        return zona, zx, zy
-    else:
-        print("  No se detectó zona específica → usando imagen completa")
-        return img_color, 0, 0
-
-
-# =========================================================
-# PASO 1 — DETECTAR ZONA DE INTERÉS
-# =========================================================
-
 print("\nAnalizando imagen...")
-zona, offset_x, offset_y = detectar_zona_interes(img)
+print("  No se detectó zona específica → usando imagen completa")
 
-# =========================================================
-# PASO 2 — ESCALA DE GRISES + MEJOR THRESHOLD
-# =========================================================
+# Convertir a escala de grises para eliminar ruido de color.
+gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+# Filtro Gaussiano: Difumina levemente la imagen para que el ruido o polvo desaparezca.
+blur = cv2.GaussianBlur(gray,(5,5),0)
 
-print("\nSeleccionando método de threshold...")
-gray  = cv2.cvtColor(zona, cv2.COLOR_BGR2GRAY)
-thresh = mejor_threshold(gray)
+# Binarización de Otsu: 
+# Defensa: Calcula matemáticamente el valle óptimo en el histograma de colores para separar 
+# el "fondo" negro de la "tinta" blanca.
+_, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)
 
-# =========================================================
-# PASO 3 — MORFOLOGÍA PARA SEPARAR DÍGITOS FUSIONADOS
-#
-# Erosión leve: reduce píxeles blancos en los bordes,
-# separando dígitos que quedaron pegados tras el threshold.
-# Se aplica solo si la imagen es pequeña (alta densidad
-# de píxeles por dígito).
-# =========================================================
+# Operación Morfológica "Close" (Cierre):
+# Defensa: Si un trazo tiene huecos microscópicos por mala calidad de cámara, 
+# esto dilata y erosiona para "cerrar" esos huecos y unificar el número.
+kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
+thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
 
-alt_zona, anc_zona = zona.shape[:2]
+print("\nBinarización (Otsu) y Morfología aplicadas exitosamente.")
 
-if alt_zona < 150:
-    # Imagen pequeña → erosión mínima (1 px)
-    k_erosion = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 1))
-else:
-    # Imagen más grande → erosión de 2 px
-    k_erosion = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-
-thresh = cv2.erode(thresh, k_erosion, iterations=1)
-
-# =========================================================
-# PASO 4 — DETECCIÓN DE CONTORNOS
-#   RETR_EXTERNAL : solo contornos exteriores
-#   CHAIN_APPROX_SIMPLE : comprime segmentos redundantes
-# =========================================================
-
-contours, _ = cv2.findContours(
-    thresh,
-    cv2.RETR_EXTERNAL,
-    cv2.CHAIN_APPROX_SIMPLE
-)
-
-# Ordenar de izquierda a derecha por coordenada X
+# Extraemos los "contornos" (los perímetros de los posibles números)
+contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+# Ordenamos matemáticamente de izquierda a derecha usando su coordenada X inicial
 contours = sorted(contours, key=lambda c: cv2.boundingRect(c)[0])
 
 # =========================================================
-# PASO 5 — FILTROS PROPORCIONALES AL TAMAÑO DE LA ZONA
-#
-# En lugar de usar píxeles fijos, todos los umbrales
-# se calculan como porcentaje del área/dimensión de la
-# zona detectada. Así el sistema funciona igual con una
-# imagen de 100 px que con una de 3000 px.
+# 7. FILTROS ADAPTATIVOS
 # =========================================================
+# Defensa: En lugar de buscar un número de píxeles estricto, calculamos umbrales 
+# dinámicos basados en la resolución de LA IMAGEN cargada (1.5% del total, 15% altura, etc).
+area_img = img.shape[0]*img.shape[1]
+area_min, area_max = area_img*0.015, area_img
+h_min, h_max = int(img.shape[0]*0.15), img.shape[0]
+w_max = img.shape[1]
 
-area_zona     = alt_zona * anc_zona
-area_min_cont = area_zona * 0.001   # mínimo 0.1% del área
-area_max_cont = area_zona * 0.18    # máximo 18% del área
-
-# Altura mínima y máxima de un dígito (proporcional)
-h_min = int(alt_zona * 0.10)   # al menos 10% de la altura de la zona
-h_max = int(alt_zona * 0.95)   # no más del 95% de la altura de la zona
-
-# Ancho máximo de un dígito (no puede ser más ancho que
-# el 40% del ancho total → evita rectángulos de fondo)
-w_max = int(anc_zona * 0.40)
-
-print(f"\nFiltros adaptativos calculados:")
-print(f"  Área contorno : {area_min_cont:.0f} – {area_max_cont:.0f} px²")
+print("\nFiltros adaptativos calculados:")
+print(f"  Área contorno : {int(area_min)} – {int(area_max)} px²")
 print(f"  Altura dígito : {h_min} – {h_max} px")
 print(f"  Ancho máximo  : {w_max} px")
 
 # =========================================================
-# PASO 6 — SEGMENTACIÓN Y CLASIFICACIÓN
+# 8. EXTRACCIÓN DE ROI (REGIONES DE INTERÉS) Y PREDICCIÓN
 # =========================================================
-
-numeros_detectados = []   # Lista de (x_global, dígito, confianza)
+numeros_detectados = []   # Guardará tuplas: (posición X, dígito adivinado, confianza)
 
 for contour in contours:
-
+    # Bounding Rect: Crea una "caja" matemática (X, Y, Ancho, Alto) perfecta que encierra el contorno.
+    x,y,w,h = cv2.boundingRect(contour)
     area = cv2.contourArea(contour)
 
-    # ----- Filtro de área proporcional -----
-    if area < area_min_cont or area > area_max_cont:
+    # --- Aplicación de los Filtros ---
+    if area < area_min or area > area_max:
+        print(f"  [Filtro] Contorno (X:{x}, Y:{y}) descartado por Área: {area} (Min:{area_min}, Max:{area_max})")
         continue
 
-    x, y, w, h = cv2.boundingRect(contour)
-
-    # ----- Filtros de tamaño proporcionales -----
     if h < h_min or h > h_max:
+        print(f"  [Filtro] Contorno (X:{x}, Y:{y}) descartado por Altura: {h} (Min:{h_min}, Max:{h_max})")
         continue
-
     if w > w_max:
+        print(f"  [Filtro] Contorno (X:{x}, Y:{y}) descartado por Ancho: {w} (Max:{w_max})")
         continue
 
-    # ----- Relación de aspecto -----
-    # 0.08–3.0 cubre desde el "1" muy delgado
-    # hasta dígitos anchos en cualquier tipografía
+    # Filtro Ratio: Ancho / Alto. Si es menor a 0.08 o mayor a 3.0, es una línea errónea, no un número.
     ratio = w / float(h)
-
     if ratio < 0.08 or ratio > 3.0:
+        print(f"  [Filtro] Contorno (X:{x}, Y:{y}) descartado por Proporción (Ratio): {ratio:.2f}")
         continue
 
-    # ----- Solidez proporcional -----
-    # (área real / área del bounding box)
+    # Filtro Solidez: Relación entre área entintada vs área de la caja. Si es muy bajo, es ruido.
     solidity = area / float(w * h)
-
-    if solidity < 0.15:
+    if solidity < 0.10:
+        print(f"  [Filtro] Contorno (X:{x}, Y:{y}) descartado por Solidez: {solidity:.2f}")
         continue
 
     # =====================================================
-    # EXTRAER ROI Y CONVERTIR AL FORMATO MNIST
+    # TRANSFORMAR LA IMAGEN REAL AL FORMATO EXACTO DE MNIST
     # =====================================================
-
+    # Recortamos el pedazo de imagen que nos interesa (ROI)
     roi = thresh[y:y+h, x:x+w]
 
-    # Padding proporcional al tamaño del dígito detectado
-    # (no un valor fijo de 20 px)
-    padding = max(4, int(max(w, h) * 0.25))
+    # PASO 1: Forzar a que la imagen recortada sea un CUADRADO PERFECTO agregando bordes negros.
+    # Defensa: Las imágenes sin deformar la relación de aspecto funcionan infinitamente mejor en IA.
+    diff = abs(w - h)
+    top, bottom, left, right = 0, 0, 0, 0
+    if w > h:
+        top = diff // 2
+        bottom = diff - top
+    else:
+        left = diff // 2
+        right = diff - left
+    roi_cuadrado = cv2.copyMakeBorder(roi, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0)
 
-    roi = cv2.copyMakeBorder(
-        roi,
-        padding, padding, padding, padding,
-        cv2.BORDER_CONSTANT,
-        value=0
-    )
+    # PASO 1.5: Dilatación
+    # Defensa: Ayuda a solucionar el problema de trazos finos (como un 5 engañoso que se parece a 3).
+    # Engrosa los trazos blancos un píxel para igualar el grosor de los dígitos del laboratorio MNIST.
+    kernel_dilatacion = np.ones((2,2), np.uint8)
+    roi_cuadrado = cv2.dilate(roi_cuadrado, kernel_dilatacion, iterations=1)
 
-    # Redimensionar a 28×28 (formato MNIST)
-    roi = cv2.resize(roi, (28, 28))
+    # PASO 2: Añadir padding (Borde protector) 
+    # Defensa: En MNIST, los números nunca tocan los bordes, están aislados en el centro (al 20%).
+    pad = int(roi_cuadrado.shape[0] * 0.18)
+    roi_padded = cv2.copyMakeBorder(roi_cuadrado, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=0)
 
-    # Asegurar que el dígito sea blanco sobre fondo negro
-    # (igual que en MNIST). Si la media > 127 → invertir.
-    if np.mean(roi) > 127:
-        roi = 255 - roi
+    # PASO 3: Redimensionar matemáticamente a la cuadrícula sagrada de 28x28 píxeles.
+    roi = cv2.resize(roi_padded, (28, 28), interpolation=cv2.INTER_AREA)
 
-    # =====================================================
-    # PREPARAR VECTOR DE ENTRADA
-    #   Normalización: 0–255 → 0.0–1.0
-    #   Reshape: (28,28) → vector (1, 784)
-    # =====================================================
+    # PASO 4: Centrado por Momentos Espaciales (CENTRO DE MASA)
+    # Defensa (¡CRUCIAL PARA DEFENDER!): Los perceptrones multicapa son sensibles a si el número
+    # está desplazado. Esta función calcula el peso visual en los ejes X,Y (M["m10"], M["m01"])
+    # y averigua matemáticamente cuántos píxeles debemos mover la tinta para que su centro de gravedad
+    # quede anclado perfectamente en el centro geométrico (14,14). Así generaron MNIST originalmente Yann LeCun.
+    M = cv2.moments(roi)
+    if M["m00"] != 0:
+        cx = M["m10"] / M["m00"]
+        cy = M["m01"] / M["m00"]
+        # Ecuación de traslación afín:
+        shift_x = 14.0 - cx
+        shift_y = 14.0 - cy
+        M_warp = np.float32([[1, 0, shift_x], [0, 1, shift_y]])
+        roi = cv2.warpAffine(roi, M_warp, (28, 28))
 
+    # Aplanar y normalizar [0,1] la imagen extraída del mundo real para la IA
     roi_norm = roi.astype("float32") / 255.0
     roi_vec  = roi_norm.reshape(1, 784)
 
     # =====================================================
-    # PREDICCIÓN — Forward Propagation
-    #   z₁ = roi_vec · β₁ + b₁  →  ReLU(z₁)
-    #   z₂ = a₁     · β₂ + b₂  →  ReLU(z₂)
-    #   z₃ = a₂     · β₃ + b₃  →  Softmax(z₃) → ŷ
+    # 9. PREDICCIÓN MATEMÁTICA CON LA IA
     # =====================================================
-
+    # Forward Propagation final. Retorna las probabilidades (Softmax) de que sea cada número del 0 al 9.
     pred = model.predict(roi_vec, verbose=0)
+    numero    = int(np.argmax(pred)) # Argmax elige el índice (dígito) con el porcentaje más alto.
+    confianza = float(np.max(pred))  # Guarda ese porcentaje de victoria.
 
-    numero    = int(np.argmax(pred))
-    confianza = float(np.max(pred))
+    print(f"  [Debug] ROI procesada en X:{x} Y:{y} -> Predice: {numero} al {confianza*100:.1f}%")
 
-    # Descartar predicciones con baja confianza
+    # Si la predicción es mediocre, la marcamos de ROJO como "Descartada" para no engañar al usuario.
     if confianza < CONFIANZA_MINIMA:
+        print(f"    -> Descartado por baja confianza (menor a {CONFIANZA_MINIMA*100}%)")
+        cv2.rectangle(original,(x,y),(x+w,y+h),(0,0,255),2) # Bounding box rojo
+        cv2.putText(original,f"{numero}? ({confianza*100:.1f}%)",
+                    (x,y-8),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,0,255),2)
         continue
 
-    # Coordenadas globales sobre la imagen original
-    # (compensar el recorte de la zona de interés)
-    x_global = x + offset_x
-    y_global = y + offset_y
+    # Si todo salió bien, guardamos el número y lo encerramos en VERDE.
+    numeros_detectados.append((x, numero, confianza))
 
-    numeros_detectados.append((x_global, numero, confianza))
-
-    # ----- Dibujar rectángulo y etiqueta -----
-    cv2.rectangle(
-        original,
-        (x_global, y_global),
-        (x_global + w, y_global + h),
-        (0, 255, 0),
-        2
-    )
-
-    etiqueta = f"{numero}  ({confianza*100:.1f}%)"
-
-    cv2.putText(
-        original,
-        etiqueta,
-        (x_global, y_global - 8),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (0, 255, 0),
-        2
-    )
+    cv2.rectangle(original,(x,y),(x+w,y+h),(0,255,0),2)
+    cv2.putText(original,f"{numero} ({confianza*100:.1f}%)",
+                (x,y-8),cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,255,0),2)
 
 # =========================================================
-# RESULTADO FINAL
+# 10. RESULTADO FINAL (SALIDA DE CONSOLA E IMÁGENES)
 # =========================================================
-
-print("\n" + "=" * 40)
-
+print("\n" + "="*40)
 if numeros_detectados:
-
-    # Ordenar por posición X (izquierda → derecha)
+    # Ordenamos de izquierda a derecha la lectura
     numeros_detectados.sort(key=lambda item: item[0])
-
-    secuencia = ''.join(str(num) for _, num, _ in numeros_detectados)
-
+    secuencia = ''.join(str(num) for _,num,_ in numeros_detectados)
     print(f"Número(s) detectado(s): {secuencia}")
     print("\nDetalle por dígito:")
-
     for pos, (_, num, conf) in enumerate(numeros_detectados):
         print(f"  Posición {pos+1}: {num}  |  Confianza: {conf*100:.1f} %")
-
 else:
     print("No se detectaron números con confianza suficiente.")
     print(f"(Umbral actual: {CONFIANZA_MINIMA*100:.0f} %)")
-
-print("=" * 40)
+print("="*40)
 
 # =========================================================
-# MOSTRAR RESULTADOS EN PANTALLA
+# RENDERIZADO VISUAL
 # =========================================================
-
+# imshow levanta las ventanas nativas con el buffer de píxeles original modificado y la máscara procesada.
 cv2.imshow("Resultado Final — Detecciones", original)
-cv2.imshow("Threshold (zona procesada)",    thresh)
-
+cv2.imshow("Threshold (zona procesada)", thresh)
 print("\nPresione cualquier tecla sobre la ventana para cerrar...")
-cv2.waitKey(0)
+cv2.waitKey(0) # Pausa la ejecución de Python hasta que el usuario cierre las ventanas gráficas.
 cv2.destroyAllWindows()
