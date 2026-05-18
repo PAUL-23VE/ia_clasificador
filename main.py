@@ -134,62 +134,44 @@ print(f"  Entradas prueba        : {x_test.shape}")
 print(f"  Etiquetas prueba       : {y_test.shape}")
 
 # =========================================================
-# 2. CARGAR MODELO EXISTENTE O CREAR UNO NUEVO
+# 2. CREACIÓN Y ENTRENAMIENTO DEL MODELO (FORZADO)
 # =========================================================
-if os.path.exists(MODELO_PATH):
-    # Si ya entrenamos antes, no perdemos tiempo y lo cargamos directamente de memoria.
-    print(f"\nModelo encontrado en '{MODELO_PATH}'. Cargando...")
-    # Le pasamos custom_objects para que sepa cómo leer nuestras clases matemáticas raras.
-    model = keras.models.load_model(MODELO_PATH, custom_objects={'ClipWeights': ClipWeights, 'OneBiasDense': OneBiasDense})
-    print("Modelo cargado correctamente.")
-    print("Recortando pesos cargados al rango [-1, 1]...")
-    # Aseguramos por seguridad que los pesos al cargar sigan cumpliendo la restricción [-1, 1]
-    for layer in model.layers:
-        try:
-            ws = layer.get_weights()
-            if not ws: continue
-            ws_clipped = [np.clip(w, -1.0, 1.0) for w in ws]
-            layer.set_weights(ws_clipped)
-        except Exception:
-            pass
-else:
-    # Si borramos el archivo, armamos la arquitectura desde cero.
-    print("\nNo se encontró modelo guardado. Creando red neuronal...")
+print("\nCreando red neuronal...")
+
+# ARQUITECTURA DEL PERCEPTRÓN MULTICAPA (MLP)
+model = keras.Sequential([
+    # Capa de Entrada: 784 píxeles simultáneos.
+    layers.Input(shape=(784,)),
     
-    # ARQUITECTURA DEL PERCEPTRÓN MULTICAPA (MLP)
-    model = keras.Sequential([
-        # Capa de Entrada: 784 píxeles simultáneos.
-        layers.Input(shape=(784,)),
-        
-        # Capa Oculta 1: 128 neuronas. 
-        # Activación ReLU: f(x) = max(0, x). Permite aprender relaciones no lineales (curvas).
-        OneBiasDense(128, activation='relu', kernel_constraint=clip, bias_constraint=clip, name="capa_oculta_1"),
-        
-        # Dropout (Regularización): 
-        # Defensa: Apaga al azar el 30% de las conexiones en cada paso. Esto IMPIDE que la red "memorice" 
-        # las imágenes exactas y la obliga a "aprender" los patrones generales, mejorando la robustez.
-        layers.Dropout(0.3),  
-        
-        # Capa Oculta 2: 64 neuronas. Embudamos la información.
-        OneBiasDense(64, activation='relu', kernel_constraint=clip, bias_constraint=clip, name="capa_oculta_2"),
-        layers.Dropout(0.2),  # Apaga el 20% para seguir forzando el aprendizaje real.
-        
-        # Capa de Salida: 10 neuronas (dígitos del 0 al 9).
-        # Activación Softmax: Convierte las salidas matemáticas brutas en Probabilidades (Porcentajes) que suman 100%.
-        OneBiasDense(10, activation='softmax', kernel_constraint=clip, bias_constraint=clip, name="capa_salida")
-    ])
+    # Capa Oculta 1: 128 neuronas. 
+    # Activación ReLU: f(x) = max(0, x). Permite aprender relaciones no lineales (curvas).
+    OneBiasDense(128, activation='relu', kernel_constraint=clip, bias_constraint=clip, name="capa_oculta_1"),
     
-    # COMPILACIÓN DEL MODELO
-    # Optimizador Adam: Ajusta la "velocidad de aprendizaje" de forma dinámica (momentos de primer y segundo orden).
-    # Función de Pérdida (Loss): Entropía Cruzada Categórica, ideal para clasificaciones multiclase.
-    model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    # Dropout (Regularización): 
+    # Defensa: Apaga al azar el 30% de las conexiones en cada paso. Esto IMPIDE que la red "memorice" 
+    # las imágenes exactas y la obliga a "aprender" los patrones generales, mejorando la robustez.
+    layers.Dropout(0.3),  
     
-    print("\nEntrenando red neuronal...\n")
-    # ENTRENAMIENTO (Backpropagation):
-    # epochs=12: Repite el aprendizaje sobre todos los datos 12 veces.
-    # batch_size=32: Lee de 32 en 32 imágenes antes de corregir sus errores, logrando estabilidad matemática.
-    historial = model.fit(x_train, y_train, epochs=12, batch_size=32, validation_data=(x_test, y_test))
-    model.save(MODELO_PATH) # Guardamos la red en disco.
+    # Capa Oculta 2: 64 neuronas. Embudamos la información.
+    OneBiasDense(64, activation='relu', kernel_constraint=clip, bias_constraint=clip, name="capa_oculta_2"),
+    layers.Dropout(0.2),  # Apaga el 20% para seguir forzando el aprendizaje real.
+    
+    # Capa de Salida: 10 neuronas (dígitos del 0 al 9).
+    # Activación Softmax: Convierte las salidas matemáticas brutas en Probabilidades (Porcentajes) que suman 100%.
+    OneBiasDense(10, activation='softmax', kernel_constraint=clip, bias_constraint=clip, name="capa_salida")
+])
+
+# COMPILACIÓN DEL MODELO
+# Optimizador Adam: Ajusta la "velocidad de aprendizaje" de forma dinámica (momentos de primer y segundo orden).
+# Función de Pérdida (Loss): Entropía Cruzada Categórica, ideal para clasificaciones multiclase.
+model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+
+print("\nEntrenando red neuronal (observa el progreso en vivo)...\n")
+# ENTRENAMIENTO (Backpropagation):
+# epochs=12: Repite el aprendizaje sobre todos los datos 12 veces.
+# batch_size=32: Lee de 32 en 32 imágenes antes de corregir sus errores, logrando estabilidad matemática.
+historial = model.fit(x_train, y_train, epochs=12, batch_size=32, validation_data=(x_test, y_test))
+model.save(MODELO_PATH) # Guardamos la red en disco para que se actualice.
 
 # =========================================================
 # 3. EVALUACIÓN DE SOBREAJUSTE (APRENDIZAJE VS MEMORIZACIÓN)
